@@ -4,6 +4,10 @@
 从详情页提取发布时间、投标截止时间与取消采购信息，按发布时间合并后返回：
 当前是否可投标、有效截止时间、项目状态以及全部来源链接。
 
+另提供**批次验真 API**：针对镜像站点上冒充正式发布的公告批次，用事先确认的
+Ed25519 公钥验证签名清单，再逐页核对详情页字节摘要——伪造清单即使与网页内容
+相互吻合，也不会被当作可信公告。
+
 ## 业务规则
 
 | 规则 | 实现位置 |
@@ -23,6 +27,91 @@
 - `pending`：待核实，存在关联页面失败或信息不完整，`effective_deadline=null`；
 - `not_found`：列表页未发现与该项目编号相关的公告。
 
+## 批次验真（`/api/v1/verify-batch`）
+
+维护人员事先确认发布方的 **Ed25519 公钥**（线下渠道获取，不经过被怀疑的镜像站）。
+验真时提供三样输入：同站 **JSON 清单 URL**、**签名 URL**（文件内容为 Base64 编码的
+Ed25519 签名，覆盖清单 HTTP 响应的**原始字节**）、**公钥**（Base64 编码的 32 字节）。
+
+信任链与安全约束（实现于 `app/verifier.py`）：
+
+| 规则 | 说明 |
+| --- | --- |
+| **先验签，后抓详情** | 签名验证失败时不解析清单、不抓取任何详情页——伪造清单与网页即使内容吻合也不可信 |
+| 签名覆盖清单原始字节 | 不做任何规范化，改动一个字节即验签失败 |
+| 清单/签名/详情**不跟随重定向** | 任何 3xx 都判为不可信 |
+| 相同 URL 只下载一次 | 重复条目共享同一次下载结果 |
+| 同一 URL 不同摘要 → 整批不可信 | 清单自相矛盾，该 URL 不下载 |
+| 详情读取失败 / 跳转 / 摘要不符 → 整批不可信 | 逐项给出 `status`、原因与来源 URL |
+| 详情 URL 必须与清单同站 | 外站条目拒绝抓取 |
+| **不回显未经验证的正文** | 响应只含 URL、摘要等元数据 |
+
+### 清单格式
+
+```json
+{
+  "batch_id": "GSB-2026-001",
+  "issued_at": "2026-11-06T10:00:00+08:00",
+  "items": [
+    {"url": "../detail/g001-original.html", "sha256": "<页面字节的 SHA-256，64 位小写十六进制>"}
+  ]
+}
+```
+
+`url` 支持相对清单地址的相对路径（解析后必须与清单同站）；`sha256` 为详情页
+**原始字节**的 SHA-256。
+
+### 调用示例
+
+```bash
+PUBKEY=$(curl -s http://localhost:8080/manifest/public.key)   # 演示公钥；生产中应线下确认
+curl -X POST http://localhost:8000/api/v1/verify-batch \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"manifest_url\": \"http://localhost:8080/manifest/batch-ok.json\",
+    \"signature_url\": \"http://localhost:8080/manifest/batch-ok.sig\",
+    \"public_key\": \"$PUBKEY\"
+  }"
+```
+
+响应关键字段：
+
+```json
+{
+  "trusted": true,
+  "signature_valid": true,
+  "batch_id": "GSB-2026-001",
+  "item_count": 3,
+  "ok_count": 3,
+  "items": [
+    {"url": "http://.../detail/g001-original.html", "status": "ok",
+     "declared_sha256": "...", "actual_sha256": "...", "detail": "摘要一致，页面字节与清单吻合"}
+  ],
+  "warnings": []
+}
+```
+
+`trusted` 为整批结论；为 `false` 时逐项查看 `items[].status`
+（`digest_mismatch` / `fetch_failed` / `redirected` / `conflicting_digests` /
+`foreign_url` / `invalid_entry`）与 `warnings`。
+
+### 内置验真样例（`sample-site/manifest/`）
+
+| 清单 | 场景 | 预期结果 |
+| --- | --- | --- |
+| `batch-ok.json` / `.sig` | 正常批次：官方密钥签名，摘要与页面一致 | `trusted=true` |
+| `batch-forged.json` / `.sig` | 伪造批次：摘要与网页**完全吻合**，但签名来自攻击者密钥 | `trusted=false`，`signature_valid=false`，未抓详情 |
+| `batch-changed.json` / `.sig` | 官方签名有效，但 `g004` 页面签发后被改动（截止时间 12:00→17:00 等） | `trusted=false`，对应项 `digest_mismatch` |
+
+演示公钥见 `sample-site/manifest/public.key`。重新生成样例（离线、结果可重现）：
+
+```bash
+python scripts/generate_manifest_samples.py
+```
+
+> 演示密钥对的 seed 固定在 `scripts/generate_manifest_samples.py` 中，仅用于本地
+> 演示与测试；生产环境必须使用离线保管的真实密钥重新签发清单。
+
 ## 目录结构
 
 ```
@@ -30,14 +119,17 @@
 ├── app/
 │   ├── main.py        # FastAPI 入口、路由、浏览器演示页
 │   ├── collector.py   # 采集编排：列表发现 → 并发抓取 → 归属判定 → 合并
+│   ├── verifier.py    # 批次验真：验签 → 清单解析 → 去重抓取 → 摘要核对
 │   ├── parser.py      # HTML 解析：同站链接发现、三层字段提取、取消识别
 │   ├── merger.py      # 业务合并规则（时间继承、延期覆盖、取消、待核实）
-│   └── models.py      # 请求/响应 Pydantic 模型
+│   └── models.py      # 请求/响应 Pydantic 模型（含清单格式）
 ├── sample-site/       # 本地示例公告站点（nginx 静态托管）
 │   ├── list.html      # 公告列表页（含外站/登录干扰链接）
-│   └── detail/        # 3 个项目的原公告/更正/取消详情页
+│   ├── detail/        # 各项目的原公告/更正/取消详情页（含内容已变更的 g004）
+│   └── manifest/      # 验真样例：正常/伪造/内容变更批次 + 演示公钥
+├── scripts/generate_manifest_samples.py  # 重新生成验真样例（可重现）
 ├── nginx/default.conf # 示例站点 nginx 配置（缺失页面返回真实 404）
-├── tests/             # 解析/合并单测 + 本地静态服务器端到端测试（30 个用例）
+├── tests/             # 解析/合并单测 + 采集与验真端到端测试（48 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -139,4 +231,8 @@ pytest -q
 - 关联归属判定结合详情页项目编号与列表行上下文（含编号列），
   即使详情页下线（只能看到列表行）也能正确判定失败是否与目标项目相关；
   无关项目的坏链接不会污染查询结果。
-- 详情页并发抓取（上限 5），统一超时、自定义 UA、跟随重定向。
+- 采集链路详情页并发抓取（上限 5），统一超时、自定义 UA、跟随重定向。
+- 验真链路相反：**任何重定向都判为不可信**——镜像站常靠跳转把请求引到被篡改的
+  副本，因此验真时清单、签名、详情页一律不跟随 3xx。
+- 验真响应永远只包含 URL 与摘要等元数据；未通过核对的页面正文不进入响应，
+  避免调用方在不知情时采信被篡改的内容。

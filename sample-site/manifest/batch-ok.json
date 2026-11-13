@@ -1,0 +1,18 @@
+{
+  "batch_id": "GSB-2026-001",
+  "issued_at": "2026-11-06T10:00:00+08:00",
+  "items": [
+    {
+      "url": "../detail/g001-original.html",
+      "sha256": "3184e2ceac1fdcba8a197520b14f7232824dacf53a095861d6882157fcd371a8"
+    },
+    {
+      "url": "../detail/g001-corr1.html",
+      "sha256": "6224040e9370a4565f0130a0d09da661679123d439dae072fc8951c9ab3355cf"
+    },
+    {
+      "url": "../detail/g001-corr2.html",
+      "sha256": "45af72f561261e83d26442ed6bc4aedea8c5678e47e3a77e3c9b39a63fa129eb"
+    }
+  ]
+}
